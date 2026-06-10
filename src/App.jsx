@@ -5,6 +5,7 @@ import Dashboard from "./components/Dashboard";
 import Recommendations from "./components/Recommendations";
 import OutfitHistory from "./components/OutfitHistory";
 import { extractDominantColors, analyzeOutfit } from "./utils/fashionAnalyzer";
+import { supabase, uploadOutfitImage } from "./utils/supabaseClient";
 const THEMES = [
   { id: "dark", label: "Dark Cyber", primaryColor: "#9d4edd", bgColor: "#070611" },
   { id: "light", label: "Classic Frost", primaryColor: "#7209b7", bgColor: "#f6f7fb" },
@@ -18,16 +19,52 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [theme, setTheme] = useState("dark");
 
-  // Initialize: Load history from localStorage and set theme
+  // Initialize: Load history from localStorage/Supabase and set theme
   useEffect(() => {
-    const savedHistory = localStorage.getItem("stylevibe_history");
-    if (savedHistory) {
-      try {
-        setHistory(JSON.parse(savedHistory));
-      } catch (e) {
-        console.error("Failed to parse history", e);
+    async function loadHistory() {
+      if (supabase) {
+        try {
+          const { data, error } = await supabase
+            .from("outfits")
+            .select("*")
+            .order("created_at", { ascending: false });
+          
+          if (error) throw error;
+          
+          if (data) {
+            const mapped = data.map(item => ({
+              id: item.id,
+              image: item.image_url,
+              occasion: item.occasion,
+              vibe: item.vibe,
+              notes: item.notes,
+              colors: item.result_json.colors || [],
+              result: item.result_json,
+              createdAt: item.created_at
+            }));
+            setHistory(mapped);
+          }
+        } catch (err) {
+          console.error("Failed to load history from Supabase, falling back to local storage:", err);
+          loadLocalHistory();
+        }
+      } else {
+        loadLocalHistory();
       }
     }
+
+    function loadLocalHistory() {
+      const savedHistory = localStorage.getItem("stylevibe_history");
+      if (savedHistory) {
+        try {
+          setHistory(JSON.parse(savedHistory));
+        } catch (e) {
+          console.error("Failed to parse local history", e);
+        }
+      }
+    }
+
+    loadHistory();
 
     const savedTheme = localStorage.getItem("stylevibe_theme");
     if (savedTheme && THEMES.some(t => t.id === savedTheme)) {
@@ -46,12 +83,45 @@ export default function App() {
 
   // Run Outfit Rating
   const handleAnalysisComplete = ({ image, occasion, vibe, notes }) => {
-    extractDominantColors(image, (colors) => {
+    extractDominantColors(image, async (colors) => {
       const result = analyzeOutfit({ colors, occasion, vibe, notes });
       
+      let finalImageUrl = image;
+      let dbId = Date.now().toString();
+
+      if (supabase) {
+        try {
+          // Upload base64 image to Supabase Storage bucket "outfits"
+          const publicUrl = await uploadOutfitImage(image, `outfit_${dbId}.jpg`);
+          finalImageUrl = publicUrl;
+          
+          // Save rating record in Supabase Table "outfits"
+          const { data, error } = await supabase
+            .from("outfits")
+            .insert([
+              {
+                image_url: finalImageUrl,
+                occasion,
+                vibe,
+                notes,
+                score: result.score,
+                result_json: { ...result, colors }
+              }
+            ])
+            .select();
+            
+          if (error) throw error;
+          if (data && data[0]) {
+            dbId = data[0].id;
+          }
+        } catch (err) {
+          console.error("Supabase sync failed, saving locally instead:", err);
+        }
+      }
+
       const newOutfit = {
-        id: Date.now().toString(),
-        image,
+        id: dbId,
+        image: finalImageUrl,
         occasion,
         vibe,
         notes,
@@ -63,7 +133,7 @@ export default function App() {
       // Update active outfit
       setActiveOutfit(newOutfit);
 
-      // Save to history list (prepend)
+      // Save to local copy and update state
       const updatedHistory = [newOutfit, ...history];
       setHistory(updatedHistory);
       localStorage.setItem("stylevibe_history", JSON.stringify(updatedHistory));
@@ -74,7 +144,19 @@ export default function App() {
     setActiveOutfit(item);
   };
 
-  const handleDeleteHistory = (id) => {
+  const handleDeleteHistory = async (id) => {
+    if (supabase) {
+      try {
+        const { error } = await supabase
+          .from("outfits")
+          .delete()
+          .eq("id", id);
+        if (error) throw error;
+      } catch (err) {
+        console.error("Failed to delete from Supabase:", err);
+      }
+    }
+
     const updatedHistory = history.filter(item => item.id !== id);
     setHistory(updatedHistory);
     localStorage.setItem("stylevibe_history", JSON.stringify(updatedHistory));
@@ -84,8 +166,20 @@ export default function App() {
     }
   };
 
-  const handleClearHistory = () => {
+  const handleClearHistory = async () => {
     if (window.confirm("Are you sure you want to clear all outfit history?")) {
+      if (supabase) {
+        try {
+          const { error } = await supabase
+            .from("outfits")
+            .delete()
+            .neq("id", "00000000-0000-0000-0000-000000000000"); // deletes all rows
+          if (error) throw error;
+        } catch (err) {
+          console.error("Failed to clear from Supabase:", err);
+        }
+      }
+
       setHistory([]);
       localStorage.removeItem("stylevibe_history");
       setActiveOutfit(null);
